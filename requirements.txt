@@ -1,0 +1,21 @@
+# Phase 1-2 deps only. FastAPI / Docker / Prometheus added in their own phases.
+# Pinned to known-stable versions for reproducibility.
+
+# Core data + ML
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.1
+xgboost==2.1.1
+imbalanced-learn==0.12.3
+
+# Experiment tracking (Phase 2)
+mlflow==2.16.2
+
+# Notebooks + EDA
+jupyterlab==4.2.5
+matplotlib==3.9.2
+seaborn==0.13.2
+
+# Tests + linting
+pytest==8.3.3
+ruff==0.6.9

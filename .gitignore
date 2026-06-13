@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# MLflow local tracking
+mlruns/
+mlartifacts/
+
+# Trained models (versioned via MLflow registry, not git)
+models/
+*.pkl
+*.joblib
+
+# Local secrets / env vars
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Phase-9 IaC state (added later, ignored now to be safe)
+*.tfstate
+*.tfstate.backup
+.terraform/
