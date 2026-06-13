@@ -17,6 +17,12 @@ jupyterlab>=4.2.5
 matplotlib>=3.9.2
 seaborn>=0.13.2
 
+# Serving (Phase 3)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+pydantic>=2.9.0
+
 # Tests + linting
 pytest>=8.3.3
+httpx>=0.27.0  # FastAPI TestClient uses httpx under the hood
 ruff>=0.6.9

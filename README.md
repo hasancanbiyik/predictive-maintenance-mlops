@@ -10,8 +10,8 @@ The model is a placeholder — the **production loop** (train → serve → cont
 |---|---|---|
 | 0 | Repo + env setup | Done |
 | 1 | Data + baseline model (XGBoost F1 = 0.768 on test) | Done |
-| 2 | MLflow experiment tracking + registry | In progress |
-| 3 | FastAPI serving (`/health`, `/predict`) | Pending |
+| 2 | MLflow experiment tracking + registry | Done |
+| 3 | FastAPI serving (`/health`, `/predict`) | In progress |
 | 4 | Docker + docker-compose (API + MLflow + monitoring stack) | Pending |
 | 5 | Kubernetes deploy (kind/minikube → AWS EKS) | Pending |
 | 6 | CI/CD via GitHub Actions | Pending |
@@ -91,6 +91,45 @@ The winning model is registered as `predictive_maintenance` and the
 `@staging` alias is pointed at the new version. **Phase 3's FastAPI service
 will load `models:/predictive_maintenance@staging`** — that handle stays
 stable no matter how many times we retrain.
+
+## Serving (Phase 3)
+
+The FastAPI service loads the registered model through its `@staging` alias —
+no file paths, no hardcoded version numbers. When the model is retrained and
+the alias re-points (Phase 8), a server restart picks up the new model with
+zero code change.
+
+```bash
+# Make sure Phase 2 was run at least once (creates mlflow.db + a registered model)
+python -m src.training.train_baseline
+
+# Launch the API
+uvicorn src.serving.app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Then:
+
+- **Swagger UI / try-it-yourself:** http://127.0.0.1:8000/docs
+- **Liveness + model info:** `GET /health`
+- **Prediction:** `POST /predict`
+
+Sample request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "type": "L",
+    "air_temp_k": 298.1,
+    "process_temp_k": 308.6,
+    "rot_speed_rpm": 1551,
+    "torque_nm": 42.8,
+    "tool_wear_min": 0
+  }'
+```
+
+Configuration is env-var overridable (matters in Phase 4 Docker / Phase 5 K8s):
+`MLFLOW_TRACKING_URI`, `MODEL_NAME`, `MODEL_ALIAS`, `DECISION_THRESHOLD`.
 
 ## Conventions
 
