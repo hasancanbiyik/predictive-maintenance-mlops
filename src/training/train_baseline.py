@@ -1,35 +1,37 @@
 """
-Phase 1 baseline: train RandomForest and XGBoost on AI4I, compare, save the best.
+Phase 2: train RF + XGBoost, log everything to MLflow, register the winner.
 
-Design notes (interview-ready):
-- We try the *simplest* class-imbalance fix first (`class_weight='balanced'` for
-  RF, `scale_pos_weight` for XGBoost). If F1 on the minority class clears 0.70
-  we stop. If not, we escalate to SMOTE in a follow-up. Always reach for the
-  blunt tool before the sharp one.
-- The metric of record is **F1 on the failure class** (label=1). On a 3.4%-
-  positive dataset, accuracy is uninformative — a model that predicts "no
-  failure" forever scores 96.6%.
-- We *also* log precision, recall, ROC-AUC, and PR-AUC. PR-AUC > ROC-AUC for
-  rare-event detection because ROC is optimistic when negatives dominate.
-- Test set is held out at split time and never touched during training.
+What this script proves in an interview:
+- Experiment tracking: every run is reproducible because params, metrics, dataset
+  hash, and the trained artifact are all captured together.
+- Model registry: the winning model gets a versioned entry under a stable name
+  so downstream services (Phase 3 API) load it by name, not by file path.
+- Backend choice: SQLite tracking store. File-backend MLflow doesn't support
+  the Model Registry; SQLite gives full feature parity with zero infra.
 
-Run: `python -m src.training.train_baseline`
+Run:
+    python -m src.training.train_baseline
+
+Browse afterwards:
+    mlflow ui --backend-store-uri sqlite:///mlflow.db
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-import pickle
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+import mlflow
+import mlflow.sklearn
+import mlflow.xgboost
+from mlflow.tracking import MlflowClient
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     average_precision_score,
-    classification_report,
     confusion_matrix,
     f1_score,
     precision_score,
@@ -38,10 +40,18 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
-from src.data.load import load_dataset
+from src.data.load import DEFAULT_CSV, load_dataset
 
-MODELS_DIR = Path("models")
-TARGET_F1 = 0.70  # minimum F1 on the minority class to consider Phase 1 "done"
+# --- Configuration --------------------------------------------------------
+
+TARGET_F1 = 0.70
+MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
+EXPERIMENT_NAME = "predictive_maintenance"
+REGISTERED_MODEL_NAME = "predictive_maintenance"
+STAGING_ALIAS = "staging"  # Phase 3 API will load `predictive_maintenance@staging`
+
+
+# --- Result container -----------------------------------------------------
 
 
 @dataclass
@@ -58,7 +68,7 @@ class EvalResult:
         return self.f1 >= target
 
 
-def evaluate(model_name: str, y_true, y_pred, y_proba) -> EvalResult:
+def _evaluate(model_name: str, y_true, y_pred, y_proba) -> EvalResult:
     return EvalResult(
         model_name=model_name,
         precision=float(precision_score(y_true, y_pred, zero_division=0)),
@@ -70,109 +80,156 @@ def evaluate(model_name: str, y_true, y_pred, y_proba) -> EvalResult:
     )
 
 
-def train_random_forest(X_train, y_train, X_test, y_test) -> tuple[Any, EvalResult]:
-    clf = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=None,
-        class_weight="balanced",  # the cheap imbalance fix
-        random_state=42,
-        n_jobs=-1,
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _log_common(
+    res: EvalResult,
+    feature_names: list[str],
+    dataset_path: Path,
+    dataset_sha: str,
+    n_train: int,
+    n_test: int,
+    n_pos_train: int,
+) -> None:
+    """Log everything not specific to a particular estimator."""
+    mlflow.log_params(
+        {
+            "model_family": res.model_name,
+            "n_features": len(feature_names),
+            "n_train": n_train,
+            "n_test": n_test,
+            "n_positives_train": n_pos_train,
+            "dataset_path": str(dataset_path),
+            "dataset_sha256": dataset_sha,
+            "decision_threshold": 0.5,
+        }
     )
-    clf.fit(X_train, y_train)
-    proba = clf.predict_proba(X_test)[:, 1]
-    pred = (proba >= 0.5).astype(int)
-    return clf, evaluate("RandomForest", y_test, pred, proba)
+    mlflow.log_metrics(
+        {
+            "precision_failure": res.precision,
+            "recall_failure": res.recall,
+            "f1_failure": res.f1,
+            "roc_auc": res.roc_auc,
+            "pr_auc": res.pr_auc,
+        }
+    )
+    # Log the confusion matrix as a JSON artifact -- searchable, diffable.
+    Path("models").mkdir(exist_ok=True)
+    cm_path = Path("models") / f"confusion_{res.model_name}.json"
+    cm_path.write_text(json.dumps(res.confusion))
+    mlflow.log_artifact(str(cm_path))
+    mlflow.set_tag("metric_of_record", "f1_failure")
+    mlflow.set_tag("passes_target", str(res.passes()))
 
 
-def train_xgboost(X_train, y_train, X_test, y_test) -> tuple[Any, EvalResult]:
-    # scale_pos_weight = neg/pos -- XGBoost's analog of class_weight='balanced'
+def train_random_forest(X_train, y_train, X_test, y_test, ctx: dict) -> tuple[Any, EvalResult, str]:
+    with mlflow.start_run(run_name="random_forest") as run:
+        params = {"n_estimators": 300, "max_depth": None, "class_weight": "balanced", "random_state": 42}
+        mlflow.log_params(params)
+        clf = RandomForestClassifier(**params, n_jobs=-1)
+        clf.fit(X_train, y_train)
+        proba = clf.predict_proba(X_test)[:, 1]
+        pred = (proba >= 0.5).astype(int)
+        res = _evaluate("RandomForest", y_test, pred, proba)
+        _log_common(res, **ctx)
+        mlflow.sklearn.log_model(clf, name="model", input_example=X_train.iloc[:2])
+        return clf, res, run.info.run_id
+
+
+def train_xgboost(X_train, y_train, X_test, y_test, ctx: dict) -> tuple[Any, EvalResult, str]:
     n_pos = int(y_train.sum())
     n_neg = int(len(y_train) - n_pos)
     spw = n_neg / max(n_pos, 1)
 
-    clf = XGBClassifier(
-        n_estimators=400,
-        max_depth=6,
-        learning_rate=0.1,
-        scale_pos_weight=spw,
-        eval_metric="aucpr",  # PR-AUC is more honest on rare events
-        tree_method="hist",
-        random_state=42,
-        n_jobs=-1,
-    )
-    clf.fit(X_train, y_train)
-    proba = clf.predict_proba(X_test)[:, 1]
-    pred = (proba >= 0.5).astype(int)
-    return clf, evaluate("XGBoost", y_test, pred, proba)
+    with mlflow.start_run(run_name="xgboost") as run:
+        params = {
+            "n_estimators": 400,
+            "max_depth": 6,
+            "learning_rate": 0.1,
+            "scale_pos_weight": spw,
+            "eval_metric": "aucpr",
+            "tree_method": "hist",
+            "random_state": 42,
+        }
+        mlflow.log_params(params)
+        clf = XGBClassifier(**params, n_jobs=-1)
+        clf.fit(X_train, y_train)
+        proba = clf.predict_proba(X_test)[:, 1]
+        pred = (proba >= 0.5).astype(int)
+        res = _evaluate("XGBoost", y_test, pred, proba)
+        _log_common(res, **ctx)
+        mlflow.xgboost.log_model(clf, name="model", input_example=X_train.iloc[:2])
+        return clf, res, run.info.run_id
 
 
-def pretty_print(res: EvalResult, y_test) -> None:
+def pretty_print(res: EvalResult) -> None:
     print(f"\n=== {res.model_name} ===")
     print(f"Precision (failure): {res.precision:.3f}")
     print(f"Recall    (failure): {res.recall:.3f}")
-    print(f"F1        (failure): {res.f1:.3f}  {'PASS' if res.passes() else 'FAIL'} (target ≥ {TARGET_F1})")
+    print(f"F1        (failure): {res.f1:.3f}  {'PASS' if res.passes() else 'FAIL'} (target >= {TARGET_F1})")
     print(f"ROC-AUC            : {res.roc_auc:.3f}")
     print(f"PR-AUC             : {res.pr_auc:.3f}")
     tn, fp, fn, tp = (res.confusion[0][0], res.confusion[0][1], res.confusion[1][0], res.confusion[1][1])
     print(f"Confusion          : TN={tn} FP={fp} FN={fn} TP={tp}")
 
 
+def register_winner(run_id: str, model_name: str) -> int:
+    """Register the winning run's model and point the @staging alias at it."""
+    client = MlflowClient()
+    model_uri = f"runs:/{run_id}/model"
+    mv = mlflow.register_model(model_uri=model_uri, name=model_name)
+    # Aliases (modern MLflow) are stable handles; better than the deprecated
+    # 'Production'/'Staging' stages. Phase 3 will load 'predictive_maintenance@staging'.
+    client.set_registered_model_alias(name=model_name, alias=STAGING_ALIAS, version=mv.version)
+    return int(mv.version)
+
+
 def main() -> int:
-    print(f"Loading dataset...")
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(EXPERIMENT_NAME)
+
+    print("Loading dataset...")
     ds = load_dataset()
+    dataset_sha = _file_sha256(DEFAULT_CSV)
     print(f"Train: {ds.X_train.shape}, Test: {ds.X_test.shape}")
-    print(f"Train positives: {int(ds.y_train.sum())} / {len(ds.y_train)}")
-    print(f"Test  positives: {int(ds.y_test.sum())} / {len(ds.y_test)}")
-    print(f"Features ({len(ds.feature_names)}): {ds.feature_names}")
+    print(f"Dataset SHA256: {dataset_sha[:16]}...")
 
-    rf_model, rf_res = train_random_forest(ds.X_train, ds.y_train, ds.X_test, ds.y_test)
-    xgb_model, xgb_res = train_xgboost(ds.X_train, ds.y_train, ds.X_test, ds.y_test)
+    ctx = dict(
+        feature_names=ds.feature_names,
+        dataset_path=DEFAULT_CSV,
+        dataset_sha=dataset_sha,
+        n_train=len(ds.X_train),
+        n_test=len(ds.X_test),
+        n_pos_train=int(ds.y_train.sum()),
+    )
 
-    pretty_print(rf_res, ds.y_test)
-    pretty_print(xgb_res, ds.y_test)
+    rf_model, rf_res, rf_run = train_random_forest(ds.X_train, ds.y_train, ds.X_test, ds.y_test, ctx)
+    xgb_model, xgb_res, xgb_run = train_xgboost(ds.X_train, ds.y_train, ds.X_test, ds.y_test, ctx)
 
-    # Pick winner by F1 on minority class
+    pretty_print(rf_res)
+    pretty_print(xgb_res)
+
     if xgb_res.f1 >= rf_res.f1:
-        best_model, best_res = xgb_model, xgb_res
+        best_res, best_run = xgb_res, xgb_run
     else:
-        best_model, best_res = rf_model, rf_res
+        best_res, best_run = rf_res, rf_run
 
     print(f"\n>>> Winner: {best_res.model_name} (F1={best_res.f1:.3f})")
 
-    # Persist
-    MODELS_DIR.mkdir(exist_ok=True)
-    model_path = MODELS_DIR / "baseline.pkl"
-    metrics_path = MODELS_DIR / "baseline_metrics.json"
-
-    with open(model_path, "wb") as f:
-        pickle.dump(
-            {
-                "model": best_model,
-                "feature_names": ds.feature_names,
-                "metric_threshold": 0.5,
-            },
-            f,
-        )
-    with open(metrics_path, "w") as f:
-        json.dump(
-            {
-                "winner": best_res.model_name,
-                "random_forest": asdict(rf_res),
-                "xgboost": asdict(xgb_res),
-            },
-            f,
-            indent=2,
-        )
-
-    print(f"Saved model    -> {model_path}")
-    print(f"Saved metrics  -> {metrics_path}")
-
     if not best_res.passes():
-        print(
-            f"\n[!] Best F1 ({best_res.f1:.3f}) below target ({TARGET_F1}). "
-            "Escalation path: add SMOTE on the train fold only, or tune the decision threshold."
-        )
+        print(f"[!] Below target ({TARGET_F1}). Not registering.")
         return 1
+
+    version = register_winner(best_run, REGISTERED_MODEL_NAME)
+    print(f">>> Registered: {REGISTERED_MODEL_NAME} v{version} (alias @{STAGING_ALIAS})")
+    print(f">>> MLflow tracking URI: {MLFLOW_TRACKING_URI}")
+    print(f">>> Browse with: mlflow ui --backend-store-uri {MLFLOW_TRACKING_URI}")
     return 0
 
 

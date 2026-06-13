@@ -8,9 +8,9 @@ The model is a placeholder — the **production loop** (train → serve → cont
 
 | # | Phase | Status |
 |---|---|---|
-| 0 | Repo + env setup | In progress |
-| 1 | Data + baseline model (RF/XGBoost, F1 ≥ 0.70 on minority class) | Pending |
-| 2 | MLflow experiment tracking + registry | Pending |
+| 0 | Repo + env setup | Done |
+| 1 | Data + baseline model (XGBoost F1 = 0.768 on test) | Done |
+| 2 | MLflow experiment tracking + registry | In progress |
 | 3 | FastAPI serving (`/health`, `/predict`) | Pending |
 | 4 | Docker + docker-compose (API + MLflow + monitoring stack) | Pending |
 | 5 | Kubernetes deploy (kind/minikube → AWS EKS) | Pending |
@@ -73,6 +73,24 @@ pip install -r requirements.txt
 # 3. Sanity check
 python -c "import pandas, sklearn, xgboost, imblearn, mlflow; print('OK')"
 ```
+
+## MLflow (Phase 2)
+
+Every training run logs to a local SQLite store (`mlflow.db`) — registry works
+with SQLite but **not** with the default file backend.
+
+```bash
+# Train both models, register the winner under @staging
+python -m src.training.train_baseline
+
+# Browse experiments + registry in your browser (http://127.0.0.1:5000)
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+The winning model is registered as `predictive_maintenance` and the
+`@staging` alias is pointed at the new version. **Phase 3's FastAPI service
+will load `models:/predictive_maintenance@staging`** — that handle stays
+stable no matter how many times we retrain.
 
 ## Conventions
 

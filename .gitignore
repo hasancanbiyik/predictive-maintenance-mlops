@@ -17,6 +17,8 @@ env/
 # MLflow local tracking
 mlruns/
 mlartifacts/
+mlflow.db
+mlflow.db-journal
 
 # Trained models (versioned via MLflow registry, not git)
 models/
