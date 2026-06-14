@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -45,7 +46,9 @@ from src.data.load import DEFAULT_CSV, load_dataset
 # --- Configuration --------------------------------------------------------
 
 TARGET_F1 = 0.70
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
+# Default to local SQLite for laptop use; compose / K8s override via env var
+# to point at the running MLflow server (`http://mlflow:5000`).
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 EXPERIMENT_NAME = "predictive_maintenance"
 REGISTERED_MODEL_NAME = "predictive_maintenance"
 STAGING_ALIAS = "staging"  # Phase 3 API will load `predictive_maintenance@staging`

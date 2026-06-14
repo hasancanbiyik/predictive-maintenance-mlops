@@ -11,8 +11,8 @@ The model is a placeholder — the **production loop** (train → serve → cont
 | 0 | Repo + env setup | Done |
 | 1 | Data + baseline model (XGBoost F1 = 0.768 on test) | Done |
 | 2 | MLflow experiment tracking + registry | Done |
-| 3 | FastAPI serving (`/health`, `/predict`) | In progress |
-| 4 | Docker + docker-compose (API + MLflow + monitoring stack) | Pending |
+| 3 | FastAPI serving (`/health`, `/predict`) | Done |
+| 4 | Docker + docker-compose (API + MLflow over HTTP) | In progress |
 | 5 | Kubernetes deploy (kind/minikube → AWS EKS) | Pending |
 | 6 | CI/CD via GitHub Actions | Pending |
 | 7 | Prometheus + Grafana + Evidently drift reports | Pending |
@@ -130,6 +130,55 @@ curl -X POST http://127.0.0.1:8000/predict \
 
 Configuration is env-var overridable (matters in Phase 4 Docker / Phase 5 K8s):
 `MLFLOW_TRACKING_URI`, `MODEL_NAME`, `MODEL_ALIAS`, `DECISION_THRESHOLD`.
+
+## Compose stack (Phase 4)
+
+Two services: `mlflow` (tracking server, host port **5001** → container 5000)
+and `api` (FastAPI, port 8000). The API container talks to MLflow over HTTP
+at `http://mlflow:5000` (compose-internal hostname). Same pattern transfers
+to K8s in Phase 5.
+
+> **Why 5001?** macOS 12+ uses port 5000 for AirPlay Receiver. We remap on
+> the host side; nothing inside the compose network changes.
+
+```bash
+# Build the API image + launch both services
+docker compose up --build -d
+
+# Tail logs (Ctrl+C to detach -- containers keep running)
+docker compose logs -f api mlflow
+```
+
+**First-time setup**: the MLflow server starts empty, so the API will return
+`status=degraded` until you train a model into it:
+
+```bash
+# Train against the running MLflow server. Host port is 5001 (not 5000) to
+# avoid macOS AirPlay Receiver, which squats on 5000.
+MLFLOW_TRACKING_URI=http://localhost:5001 \
+  python -m src.training.train_baseline
+```
+
+After training, the model is registered into the *containerized* MLflow.
+Restart the API so it picks up the new `@staging` alias:
+
+```bash
+docker compose restart api
+curl -s http://127.0.0.1:8000/health | python -m json.tool
+# MLflow UI at http://127.0.0.1:5001
+```
+
+Tear it down (volumes persist):
+
+```bash
+docker compose down
+```
+
+Wipe it (volumes too):
+
+```bash
+docker compose down -v
+```
 
 ## Conventions
 

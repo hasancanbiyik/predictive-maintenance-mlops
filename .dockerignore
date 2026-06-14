@@ -1,0 +1,46 @@
+# Keep the image small and the build fast by sending less to the daemon.
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtualenvs (huge; rebuilt inside the image)
+.venv/
+venv/
+
+# Local MLflow state (the container talks to the MLflow server, not files)
+mlruns/
+mlartifacts/
+mlflow.db
+mlflow.db-journal
+models/
+
+# Notebooks + raw data (data is not baked into the API image)
+notebooks/
+data/
+.ipynb_checkpoints/
+
+# Tests aren't shipped to runtime
+tests/
+
+# Git, IDE, OS
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Docs that don't affect runtime
+README.md
+project_description.md
+*.md
+
+# Other
+.env
+.env.*
+Dockerfile
+docker-compose.yml
+.dockerignore

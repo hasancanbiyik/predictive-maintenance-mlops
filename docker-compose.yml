@@ -1,0 +1,69 @@
+# Phase 4 stack: MLflow tracking server + FastAPI serving container.
+#
+# Why this shape (interview-ready):
+#  - MLflow runs in its own container so the API talks to it over HTTP via
+#    MLFLOW_TRACKING_URI=http://mlflow:5000. Same pattern transfers to K8s
+#    (Phase 5) -- the only thing that changes is the hostname.
+#  - --serve-artifacts proxies model artifacts over HTTP. No shared volume
+#    needed between API and MLflow. In the cloud this becomes S3, but the
+#    API code stays identical because it asks the MLflow server, not the
+#    storage backend.
+#  - Training is NOT in this stack. You run the trainer from your laptop
+#    against the running MLflow server (MLFLOW_TRACKING_URI=http://localhost:5000).
+#    Containerized training arrives in Phase 8 (auto-retrain).
+
+services:
+  mlflow:
+    # Pin to match the local client (mlflow 3.13.0). MLflow 3.x introduced new
+    # tracking endpoints (e.g. /api/2.0/mlflow/logged-models) that 2.x doesn't
+    # serve, so a 3.x client against a 2.x server fails with 404.
+    image: ghcr.io/mlflow/mlflow:v3.13.0
+    container_name: mlflow
+    # Host port 5001 because macOS uses 5000 for AirPlay Receiver. Inside
+    # the compose network the API still reaches MLflow at http://mlflow:5000.
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow_db:/mlruns
+      - mlflow_artifacts:/mlartifacts
+    # MLflow 3.5+ added DNS-rebinding host-header validation. The server
+    # rejects requests whose Host header isn't in an allow list. The API
+    # container connects via `http://mlflow:5000`, sending `Host: mlflow:5000`,
+    # which isn't in the default list (localhost + private IPs) -> 403.
+    # The CLI flag `--allowed-hosts` is the authoritative way to extend it.
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --allowed-hosts mlflow:*,localhost,127.0.0.1
+      --backend-store-uri sqlite:////mlruns/mlflow.db
+      --default-artifact-root mlflow-artifacts:/
+      --artifacts-destination /mlartifacts
+      --serve-artifacts
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: predictive-maintenance-api:0.4.0
+    container_name: pdm-api
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: predictive_maintenance
+      MODEL_ALIAS: staging
+      DECISION_THRESHOLD: "0.5"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+
+volumes:
+  mlflow_db:
+  mlflow_artifacts:
