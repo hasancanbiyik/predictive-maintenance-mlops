@@ -21,10 +21,13 @@ Then visit:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import mlflow
@@ -32,6 +35,8 @@ import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, status
 from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
+from prometheus_client import Counter, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.data.load import CLEAN_NUMERIC_FEATURES
 from src.serving.schemas import HealthResponse, PredictRequest, PredictResponse
@@ -42,6 +47,11 @@ MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 REGISTERED_MODEL_NAME = os.getenv("MODEL_NAME", "predictive_maintenance")
 MODEL_ALIAS = os.getenv("MODEL_ALIAS", "staging")
 DECISION_THRESHOLD = float(os.getenv("DECISION_THRESHOLD", "0.5"))
+
+# Phase 7: where to capture live prediction inputs for offline drift analysis.
+# Each line is a JSON object: timestamp + model version + the raw request fields.
+PREDICTIONS_LOG = Path(os.getenv("PREDICTIONS_LOG", "/var/log/pdm/predictions.jsonl"))
+_log_lock = threading.Lock()
 
 # Feature column order the trained model expects. Must match what
 # `src.data.load.build_features()` produces, in order.
@@ -137,8 +147,50 @@ def _clear_model_cache() -> None:
 app = FastAPI(
     title="Predictive Maintenance API",
     description="Predicts machine failure from sensor readings. Model loaded via MLflow Model Registry.",
-    version="0.3.0",
+    version="0.7.0",
 )
+
+# Phase 7: Prometheus metrics.
+#  - The Instrumentator auto-exposes /metrics with HTTP request rate, latency
+#    histograms, and status-code counters keyed on endpoint -- no code per
+#    endpoint.
+#  - Custom metrics capture what makes this an *ML* service rather than a
+#    plain web app: how many predictions, by class, and the probability
+#    distribution. Drift in either is a signal.
+Instrumentator().instrument(app).expose(app)
+
+PREDICTIONS_COUNTER = Counter(
+    "pdm_predictions_total",
+    "Total predictions served",
+    ["model_version", "prediction"],
+)
+PROBABILITY_HISTOGRAM = Histogram(
+    "pdm_prediction_probability",
+    "Distribution of predicted failure probabilities",
+    ["model_version"],
+    buckets=(0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99),
+)
+
+
+def _append_prediction_log(req: PredictRequest, proba: float, bundle: "ModelBundle") -> None:
+    """Append a single JSON line for offline drift analysis.
+
+    Best-effort: a logging-disk failure must not break /predict. Production
+    versions of this would push to Kafka/Kinesis instead of a local file.
+    """
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "model_version": bundle.version,
+        "model_alias": bundle.alias,
+        "probability": proba,
+        **req.model_dump(),
+    }
+    try:
+        PREDICTIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _log_lock, PREDICTIONS_LOG.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        logger.warning("Failed to append prediction log: %s", e)
 
 
 def _to_feature_frame(req: PredictRequest) -> pd.DataFrame:
@@ -206,6 +258,12 @@ def predict(
     X = _to_feature_frame(req)
     proba = float(bundle.model.predict_proba(X)[0, 1])
     pred = int(proba >= DECISION_THRESHOLD)
+
+    # Phase 7 instrumentation: counter + histogram, then JSONL drift log.
+    PREDICTIONS_COUNTER.labels(model_version=str(bundle.version), prediction=str(pred)).inc()
+    PROBABILITY_HISTOGRAM.labels(model_version=str(bundle.version)).observe(proba)
+    _append_prediction_log(req, proba, bundle)
+
     return PredictResponse(
         prediction=pred,
         probability=proba,

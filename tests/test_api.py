@@ -118,6 +118,21 @@ def test_ready_returns_200_when_model_loaded(client):
     assert r.json()["status"] == "ok"
 
 
+def test_metrics_endpoint_exposes_prometheus_text(client):
+    """Phase 7: /metrics should be Prometheus exposition format with our custom keys."""
+    # Drive one prediction first so the custom counters appear in output.
+    client.post("/predict", json=VALID_PAYLOAD)
+
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    body = r.text
+    # Built-in HTTP metrics from the instrumentator
+    assert "http_request_duration_seconds" in body
+    # Our custom ML metrics
+    assert "pdm_predictions_total" in body
+    assert "pdm_prediction_probability" in body
+
+
 def test_ready_returns_503_when_no_model():
     """/ready returns 503 when the model isn't loaded so K8s pulls the pod
     out of the Service's rotation. /health stays 200 so K8s doesn't restart."""

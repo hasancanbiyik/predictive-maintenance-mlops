@@ -16,8 +16,8 @@ The model is a placeholder — the **production loop** (train → serve → cont
 | 3 | FastAPI serving (`/health`, `/predict`) | Done |
 | 4 | Docker + docker-compose (API + MLflow over HTTP) | Done |
 | 5 | Kubernetes deploy on kind (manifests in `k8s/`) | Done |
-| 6 | CI/CD via GitHub Actions → GHCR | In progress |
-| 7 | Prometheus + Grafana + Evidently drift reports | Pending |
+| 6 | CI/CD via GitHub Actions → GHCR | Done |
+| 7 | Prometheus + Grafana + Evidently drift reports | In progress |
 | 8 | Drift-triggered / scheduled auto-retraining (+ **DVC** for dataset versioning here) | Pending |
 | 9 | Terraform IaC + architecture diagram + demo | Pending |
 
@@ -263,6 +263,64 @@ kubectl rollout status deployment/pdm-api -n pdm
 The deployment rolls; readiness probes gate traffic; if the new image breaks,
 `kubectl rollout undo deployment/pdm-api -n pdm` reverts to the previous
 working image in seconds.
+
+## Monitoring + drift (Phase 7)
+
+Compose now runs four services: `mlflow`, `api`, `prometheus`, `grafana`.
+
+| Service | URL | Notes |
+|---|---|---|
+| API | http://localhost:8000 | `/metrics` exposes Prometheus exposition format |
+| Prometheus | http://localhost:9090 | Scrapes `api:8000/metrics` every 10s |
+| Grafana | http://localhost:3000 | login `admin` / `admin`; "Predictive Maintenance API" dashboard pre-provisioned |
+| MLflow | http://localhost:5001 | unchanged |
+
+Custom metrics emitted by the API:
+
+- `pdm_predictions_total{model_version, prediction}` — counter
+- `pdm_prediction_probability{model_version}` — histogram (10 buckets)
+
+```bash
+# Build the new 0.7.0 image + bring everything up
+docker compose up --build -d
+
+# Train against the running MLflow (same as Phase 4)
+MLFLOW_TRACKING_URI=http://localhost:5001 \
+  python -m src.training.train_baseline
+docker compose restart api
+
+# Drive traffic so dashboards have something to show
+for i in $(seq 1 200); do
+  curl -s -X POST http://localhost:8000/predict \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"L","air_temp_k":298.1,"process_temp_k":308.6,"rot_speed_rpm":1551,"torque_nm":42.8,"tool_wear_min":0}' \
+    > /dev/null
+done
+
+# Watch the panels light up
+open http://localhost:3000
+```
+
+### Drift detection
+
+Every prediction is appended to a JSONL log inside the `predictions_log` volume.
+The drift script reads that log and compares the live input distribution to
+the training distribution:
+
+```bash
+# Copy the log out of the container volume so the host script can read it
+docker compose cp api:/var/log/pdm/predictions.jsonl data/predictions/predictions.jsonl
+
+python -m src.monitoring.drift \
+  --predictions data/predictions/predictions.jsonl \
+  --out artifacts/drift
+
+open artifacts/drift/drift_report.html
+```
+
+Phase 8 will wrap this script in a scheduled job: if drift exceeds a threshold,
+retrain → register → re-point `@staging` → API picks up the new version on
+next restart.
 
 ## Conventions
 

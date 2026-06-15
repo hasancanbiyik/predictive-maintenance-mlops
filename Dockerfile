@@ -48,6 +48,11 @@ ENV PYTHONUNBUFFERED=1 \
 # CVE exposure; this is the kind of detail K8s security reviewers flag.
 RUN useradd --create-home --uid 10001 appuser
 
+# Pre-create the prediction-log dir with appuser ownership so the named
+# volume mounted at this path on first run inherits the right perms. Without
+# this, the volume comes up root-owned and appuser silently fails to write.
+RUN mkdir -p /var/log/pdm && chown -R appuser:appuser /var/log/pdm
+
 # Bring in the installed packages from the builder stage.
 COPY --from=builder /install /usr/local
 

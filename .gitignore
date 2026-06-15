@@ -25,6 +25,10 @@ models/
 *.pkl
 *.joblib
 
+# Phase 7: live-prediction logs + generated drift reports
+data/predictions/
+artifacts/
+
 # Local secrets / env vars
 .env
 .env.local

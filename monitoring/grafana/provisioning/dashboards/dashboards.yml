@@ -1,0 +1,12 @@
+# Tell Grafana to auto-load any JSON dashboard from /var/lib/grafana/dashboards.
+apiVersion: 1
+
+providers:
+  - name: pdm
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
