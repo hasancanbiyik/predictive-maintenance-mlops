@@ -1,0 +1,62 @@
+# Phase 9 polish: scheduled in-cluster retrain orchestrator.
+#
+# NOT applied as part of Phase 8 smoke testing -- this manifest sits ready
+# for when the rest of the K8s stack is back up. To enable:
+#
+#   kubectl apply -f k8s/cronjob.yaml
+#   kubectl get cronjob -n pdm
+#   kubectl create job -n pdm --from=cronjob/pdm-retrain pdm-retrain-manual
+#
+# The Pod needs:
+#  - Network access to the in-cluster MLflow Service (http://mlflow:5000)
+#  - Read access to the prediction-log PVC the API writes to
+#
+# To wire the PVC: the API Deployment in k8s/api.yaml currently has no
+# emptyDir / PVC for the log. Phase 9 should add a shared PVC mounted by both
+# the API and this CronJob (ReadWriteOnce won't work for two pods; use a
+# storage class that supports ReadWriteMany, e.g. AWS EFS, NFS, GCS FUSE).
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pdm-retrain
+  namespace: pdm
+spec:
+  schedule: "0 7 * * *"        # daily 07:00 UTC; tune per your data velocity
+  concurrencyPolicy: Forbid    # never overlap retrains
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: orchestrator
+              # Reuse the API image -- it already has the project code + deps.
+              image: ghcr.io/hasancanbiyik/predictive-maintenance-api:latest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "src.orchestrator.retrain"]
+              env:
+                - name: MLFLOW_TRACKING_URI
+                  value: "http://mlflow:5000"
+                - name: MODEL_NAME
+                  value: "predictive_maintenance"
+                - name: MODEL_ALIAS
+                  value: "staging"
+                - name: PREDICTIONS_LOG
+                  value: "/var/log/pdm/predictions.jsonl"
+              volumeMounts:
+                - name: predictions
+                  mountPath: /var/log/pdm
+              resources:
+                requests: { cpu: "200m", memory: "512Mi" }
+                limits:   { cpu: "1",    memory: "2Gi"   }
+          volumes:
+            - name: predictions
+              # Phase 9: replace with the shared PVC name once provisioned.
+              # As a stop-gap for demo we use emptyDir -- nothing useful gets
+              # mounted but the CronJob can at least be scheduled and run.
+              emptyDir: {}

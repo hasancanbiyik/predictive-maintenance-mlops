@@ -17,8 +17,8 @@ The model is a placeholder — the **production loop** (train → serve → cont
 | 4 | Docker + docker-compose (API + MLflow over HTTP) | Done |
 | 5 | Kubernetes deploy on kind (manifests in `k8s/`) | Done |
 | 6 | CI/CD via GitHub Actions → GHCR | Done |
-| 7 | Prometheus + Grafana + Evidently drift reports | In progress |
-| 8 | Drift-triggered / scheduled auto-retraining (+ **DVC** for dataset versioning here) | Pending |
+| 7 | Prometheus + Grafana + Evidently drift reports | Done |
+| 8 | Drift-triggered auto-retraining with champion-challenger gate | In progress |
 | 9 | Terraform IaC + architecture diagram + demo | Pending |
 
 > **DVC note:** intentionally deferred from Phase 2 to Phase 8. Versioning a single
@@ -321,6 +321,61 @@ open artifacts/drift/drift_report.html
 Phase 8 will wrap this script in a scheduled job: if drift exceeds a threshold,
 retrain → register → re-point `@staging` → API picks up the new version on
 next restart.
+
+## Auto-retraining (Phase 8)
+
+The orchestrator at `src/orchestrator/retrain.py` closes the MLOps loop:
+
+```
+prediction log -> drift check -> if drift, train challenger ->
+  champion-challenger comparison -> promote only if challenger wins
+```
+
+```bash
+# Run it manually. Reads data/predictions/predictions.jsonl (copy it out
+# of the API container first, same as Phase 7).
+python -m src.orchestrator.retrain
+
+# Skip the drift gate -- always train a challenger
+python -m src.orchestrator.retrain --force
+
+# Require at least a 1% absolute F1 gain over the champion before promoting
+python -m src.orchestrator.retrain --min-gain 0.01
+```
+
+Exit codes are how a scheduler (cron / GitHub Actions / Argo) decides whether
+to alert: `0` no-op or promoted, `2` drift but no improvement, `3` training
+failed, `4` no prediction log yet.
+
+### What's auto and what's NOT (interview honesty)
+
+What this pipeline auto-does: detect drift, train a challenger, compare F1
+to the registered champion, promote only if better, persist a decision
+record. What it doesn't do, and what a production version would add:
+
+- **Shadow deployment** — serve the challenger alongside the champion on
+  live traffic, compare without exposing users to the new model.
+- **Statistical significance** — a single-shot F1 delta of 0.005 is noise.
+  Real systems require multiple training seeds + a p-value, or a 5%+ gain.
+- **Manual approval gate** — regulated domains require a human sign-off
+  before any production model swap.
+- **Time-based fallback** — scheduled retraining (e.g. weekly) regardless of
+  drift, because covariate drift in inputs isn't the only failure mode.
+
+### Scheduling
+
+- **GitHub Actions (cloud-side):** `.github/workflows/retrain.yml` is set
+  to `workflow_dispatch` (manual) until there's a hosted MLflow to point at.
+  Uncomment the `schedule:` block to enable daily 07:00 UTC runs.
+- **Kubernetes CronJob (in-cluster):** `k8s/cronjob.yaml` is written but NOT
+  applied yet — see the TODO below.
+
+## TODO before final demo
+
+- [ ] Apply `k8s/cronjob.yaml` against a running kind / EKS cluster (Phase 9).
+  Requires a shared PVC (RWX storage class) so the orchestrator pod can read
+  the API's prediction log.
+- [ ] Phase 9: Terraform for cloud infra, architecture diagram, demo video.
 
 ## Conventions
 

@@ -1,0 +1,50 @@
+# Scheduled drift-triggered retrain workflow.
+#
+# NOTE FOR PORTFOLIO REVIEWERS: this workflow demonstrates the *shape* of a
+# scheduled retrainer. To run it for real, the workflow needs network access
+# to an MLflow tracking server that's reachable from a GitHub-hosted runner
+# (i.e. cloud-hosted MLflow, not localhost). Phase 9 polish covers the AWS
+# variant where this becomes useful. For now, run the orchestrator locally:
+#
+#     python -m src.orchestrator.retrain --force
+#
+# The workflow is set to manual-only (`workflow_dispatch`) to avoid scheduled
+# runs failing visibly while there's no hosted MLflow to talk to. To enable
+# the actual schedule, uncomment the `schedule:` block.
+
+name: Scheduled Retrain
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "0 7 * * *"   # daily at 07:00 UTC
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run orchestrator
+        # In production: set MLFLOW_TRACKING_URI to the hosted MLflow's HTTPS URL,
+        # and provide a PREDICTIONS_LOG path -- e.g. download it from S3 first.
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI || 'sqlite:///mlflow.db' }}
+        run: |
+          python -m src.orchestrator.retrain --force

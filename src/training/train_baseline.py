@@ -193,10 +193,24 @@ def register_winner(run_id: str, model_name: str) -> int:
     return int(mv.version)
 
 
-def main() -> int:
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(EXPERIMENT_NAME)
+def train_pipeline() -> dict:
+    """Train RF + XGBoost, log to MLflow, return a dict the orchestrator
+    needs to make a register/skip decision.
 
+    Caller is responsible for calling `mlflow.set_tracking_uri` and
+    `mlflow.set_experiment` first -- they're cheap and harmless to call
+    multiple times, so main() / the orchestrator each call them.
+
+    Returns:
+        {
+            "winner_name": "XGBoost" | "RandomForest",
+            "winner_run_id": str,
+            "winner_f1": float,
+            "winner_passes": bool,   # F1 >= TARGET_F1
+            "results": {"RandomForest": EvalResult, "XGBoost": EvalResult},
+            "run_ids": {"RandomForest": str, "XGBoost": str},
+        }
+    """
     print("Loading dataset...")
     ds = load_dataset()
     dataset_sha = _file_sha256(DEFAULT_CSV)
@@ -212,24 +226,47 @@ def main() -> int:
         n_pos_train=int(ds.y_train.sum()),
     )
 
-    rf_model, rf_res, rf_run = train_random_forest(ds.X_train, ds.y_train, ds.X_test, ds.y_test, ctx)
-    xgb_model, xgb_res, xgb_run = train_xgboost(ds.X_train, ds.y_train, ds.X_test, ds.y_test, ctx)
+    _, rf_res, rf_run = train_random_forest(ds.X_train, ds.y_train, ds.X_test, ds.y_test, ctx)
+    _, xgb_res, xgb_run = train_xgboost(ds.X_train, ds.y_train, ds.X_test, ds.y_test, ctx)
 
     pretty_print(rf_res)
     pretty_print(xgb_res)
 
     if xgb_res.f1 >= rf_res.f1:
-        best_res, best_run = xgb_res, xgb_run
+        winner_name, winner_res, winner_run = "XGBoost", xgb_res, xgb_run
     else:
-        best_res, best_run = rf_res, rf_run
+        winner_name, winner_res, winner_run = "RandomForest", rf_res, rf_run
 
-    print(f"\n>>> Winner: {best_res.model_name} (F1={best_res.f1:.3f})")
+    print(f"\n>>> Winner: {winner_name} (F1={winner_res.f1:.3f})")
 
-    if not best_res.passes():
+    return {
+        "winner_name": winner_name,
+        "winner_run_id": winner_run,
+        "winner_f1": winner_res.f1,
+        "winner_passes": winner_res.passes(),
+        "results": {"RandomForest": rf_res, "XGBoost": xgb_res},
+        "run_ids": {"RandomForest": rf_run, "XGBoost": xgb_run},
+    }
+
+
+def main() -> int:
+    """CLI entrypoint: train + auto-register if winner clears TARGET_F1.
+
+    Behavior preserved from Phase 2 so the MLflow integration test and
+    `python -m src.training.train_baseline` still work the same way. The
+    Phase 8 orchestrator bypasses this and uses `train_pipeline()` directly
+    so it can apply champion-challenger logic before registering.
+    """
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(EXPERIMENT_NAME)
+
+    info = train_pipeline()
+
+    if not info["winner_passes"]:
         print(f"[!] Below target ({TARGET_F1}). Not registering.")
         return 1
 
-    version = register_winner(best_run, REGISTERED_MODEL_NAME)
+    version = register_winner(info["winner_run_id"], REGISTERED_MODEL_NAME)
     print(f">>> Registered: {REGISTERED_MODEL_NAME} v{version} (alias @{STAGING_ALIAS})")
     print(f">>> MLflow tracking URI: {MLFLOW_TRACKING_URI}")
     print(f">>> Browse with: mlflow ui --backend-store-uri {MLFLOW_TRACKING_URI}")
