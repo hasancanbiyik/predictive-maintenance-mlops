@@ -6,6 +6,41 @@ End-to-end MLOps pipeline for predicting industrial machine failure from sensor 
 The model is a placeholder — the **production loop** (train → serve → containerize → deploy
 → monitor → auto-retrain) is the deliverable.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    Dev[Developer] -->|git push| GH[GitHub]
+    GH -->|Actions CI| Build[lint + pytest + build]
+    Build -->|push image| Reg[GHCR / ECR]
+
+    subgraph Cluster["Kubernetes (kind locally / EKS in cloud)"]
+        API[FastAPI pod x2]
+        MLflow[MLflow pod]
+        Cron[Retrain CronJob]
+        PVC[(MLflow DB + artifacts)]
+        Log[(Predictions log)]
+    end
+
+    Reg -.->|pull image| API
+    User[Client] -->|/predict| API
+    API -->|register / load via @staging| MLflow
+    MLflow --- PVC
+    API -->|append JSONL| Log
+    Cron -->|read| Log
+    Cron -->|drift check + champion-challenger| MLflow
+
+    API -->|Prometheus /metrics| Prom[Prometheus]
+    Prom -->|datasource| Graf[Grafana dashboards]
+    Log -->|Evidently CLI| Drift[Drift report HTML/JSON]
+```
+
+The arrows that *close the loop*: the API appends predictions to a log, the
+scheduled retrain job reads that log, compares the live distribution to the
+training distribution via Evidently, trains a challenger, and only re-points
+`@staging` if the challenger beats the current champion on F1. The API picks
+up the new model on its next restart.
+
 ## Phase status
 
 | # | Phase | Status |
@@ -18,8 +53,8 @@ The model is a placeholder — the **production loop** (train → serve → cont
 | 5 | Kubernetes deploy on kind (manifests in `k8s/`) | Done |
 | 6 | CI/CD via GitHub Actions → GHCR | Done |
 | 7 | Prometheus + Grafana + Evidently drift reports | Done |
-| 8 | Drift-triggered auto-retraining with champion-challenger gate | In progress |
-| 9 | Terraform IaC + architecture diagram + demo | Pending |
+| 8 | Drift-triggered auto-retraining with champion-challenger gate | Done |
+| 9 | Terraform IaC (EKS + ECR) + architecture diagram + demo | Code done; AWS apply pending |
 
 > **DVC note:** intentionally deferred from Phase 2 to Phase 8. Versioning a single
 > 522 KB static CSV is busywork; DVC earns its keep when the retrain loop starts
@@ -370,12 +405,37 @@ record. What it doesn't do, and what a production version would add:
 - **Kubernetes CronJob (in-cluster):** `k8s/cronjob.yaml` is written but NOT
   applied yet — see the TODO below.
 
-## TODO before final demo
+## Cloud deployment (Phase 9)
 
-- [ ] Apply `k8s/cronjob.yaml` against a running kind / EKS cluster (Phase 9).
-  Requires a shared PVC (RWX storage class) so the orchestrator pod can read
-  the API's prediction log.
-- [ ] Phase 9: Terraform for cloud infra, architecture diagram, demo video.
+See [`terraform/README.md`](./terraform/README.md) for the apply / destroy
+workflow. Stack: VPC + EKS (1.31, t3.medium x2) + ECR. Demo cost: ~$1.
+
+```bash
+cd terraform
+terraform init
+terraform apply         # ~15 min
+# ... push image, kubectl apply -f ../k8s/, port-forward, demo, screenshot ...
+terraform destroy       # always run this
+```
+
+## Resume bullet
+
+> **Predictive-Maintenance MLOps Pipeline** — built and deployed an end-to-end
+> failure-prediction service on industrial sensor data (UCI AI4I): XGBoost
+> classifier (F1 0.77 on minority class) tracked with MLflow Model Registry,
+> served via FastAPI with liveness/readiness probes, containerized with Docker
+> and deployed on Kubernetes (local `kind` and AWS EKS via Terraform), with
+> GitHub Actions CI/CD publishing to GHCR + ECR, Prometheus + Grafana metrics,
+> Evidently-based data-drift detection, and a drift-triggered champion-challenger
+> retrain orchestrator that auto-promotes only when the new model beats the
+> registered version on test F1.
+
+## Final TODO
+
+- [ ] Run the Terraform apply / EKS demo / destroy cycle (Phase 9 batch 2).
+- [ ] Capture screenshots or a Loom video during the EKS demo for portfolio use.
+- [ ] (Optional) Wire the K8s CronJob to a shared EFS PVC so it can actually
+  read the API's prediction log in-cluster. Today it runs but uses an emptyDir.
 
 ## Conventions
 

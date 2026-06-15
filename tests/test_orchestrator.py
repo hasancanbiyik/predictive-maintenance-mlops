@@ -17,7 +17,6 @@ from unittest import mock
 
 import mlflow
 import pytest
-from mlflow.tracking import MlflowClient
 
 from src.orchestrator import retrain
 
