@@ -1,5 +1,7 @@
 # Predictive Maintenance MLOps Pipeline
 
+![CI](https://github.com/hasancanbiyik/predictive-maintenance-mlops/actions/workflows/ci.yml/badge.svg)
+
 End-to-end MLOps pipeline for predicting industrial machine failure from sensor data.
 The model is a placeholder — the **production loop** (train → serve → containerize → deploy
 → monitor → auto-retrain) is the deliverable.
@@ -13,8 +15,8 @@ The model is a placeholder — the **production loop** (train → serve → cont
 | 2 | MLflow experiment tracking + registry | Done |
 | 3 | FastAPI serving (`/health`, `/predict`) | Done |
 | 4 | Docker + docker-compose (API + MLflow over HTTP) | Done |
-| 5 | Kubernetes deploy on kind (manifests in `k8s/`) | In progress |
-| 6 | CI/CD via GitHub Actions | Pending |
+| 5 | Kubernetes deploy on kind (manifests in `k8s/`) | Done |
+| 6 | CI/CD via GitHub Actions → GHCR | In progress |
 | 7 | Prometheus + Grafana + Evidently drift reports | Pending |
 | 8 | Drift-triggered / scheduled auto-retraining (+ **DVC** for dataset versioning here) | Pending |
 | 9 | Terraform IaC + architecture diagram + demo | Pending |
@@ -230,6 +232,37 @@ Tear down:
 kubectl delete namespace pdm        # wipe just the app
 kind delete cluster --name pdm      # wipe the whole cluster
 ```
+
+## CI/CD (Phase 6)
+
+A single GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every
+push and PR.
+
+- **`lint-and-test`** (always) — ruff + pytest. PRs are blocked from merging
+  until this passes.
+- **`build-and-push`** (only on push to `main`) — builds the API Docker image
+  and publishes to GHCR under two tags:
+  - `ghcr.io/<owner>/predictive-maintenance-api:latest`
+  - `ghcr.io/<owner>/predictive-maintenance-api:sha-<short-sha>`
+
+The `sha-` tag is immutable (the bytes for `sha-abc1234` never change), so
+deployments can pin to it and roll back precisely. `latest` is the convenient
+"current main" pointer.
+
+### Rolling the K8s API to a CI-built image
+
+Once the workflow has run at least once and an image exists in GHCR:
+
+```bash
+# Find the latest sha tag at https://github.com/<owner>?tab=packages
+kubectl set image deployment/pdm-api -n pdm \
+  api=ghcr.io/<owner>/predictive-maintenance-api:sha-<short-sha>
+kubectl rollout status deployment/pdm-api -n pdm
+```
+
+The deployment rolls; readiness probes gate traffic; if the new image breaks,
+`kubectl rollout undo deployment/pdm-api -n pdm` reverts to the previous
+working image in seconds.
 
 ## Conventions
 
