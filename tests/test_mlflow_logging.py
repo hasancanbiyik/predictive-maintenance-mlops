@@ -13,7 +13,6 @@ slowest test in the suite -- but still well under a minute on a laptop CPU.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import mlflow

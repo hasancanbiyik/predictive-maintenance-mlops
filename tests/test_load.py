@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import math
 
-import pytest
-
 from src.data.load import (
     CLEAN_NUMERIC_FEATURES,
     LEAKAGE_COLS,
