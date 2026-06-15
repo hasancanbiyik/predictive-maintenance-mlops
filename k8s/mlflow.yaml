@@ -1,0 +1,114 @@
+# MLflow tracking server: PVC for state, single-replica Deployment, ClusterIP
+# Service so other pods reach it as http://mlflow:5000.
+#
+# Why ReadWriteOnce + 1 replica:
+#   MLflow with a SQLite backend cannot scale beyond one writer. In real prod
+#   you'd run Postgres as a separate StatefulSet and run MLflow with more
+#   replicas. That's a Phase-9 polish item; here we own the limitation.
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow-data
+  namespace: pdm
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: pdm
+  labels:
+    app: mlflow
+spec:
+  replicas: 1
+  # Recreate (not RollingUpdate) because the PVC is ReadWriteOnce -- two
+  # mlflow pods can't mount the volume at the same time during a rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      containers:
+        - name: mlflow
+          image: ghcr.io/mlflow/mlflow:v3.13.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "mlflow"
+            - "server"
+            - "--host=0.0.0.0"
+            - "--port=5000"
+            # DNS-rebinding allow list. `mlflow:*` matches Host: mlflow:5000
+            # from intra-namespace calls. The FQDN form is for callers using
+            # the fully-qualified service DNS name.
+            # Wildcards on every entry because the MLflow 3.x matcher does NOT
+            # strip the port from the Host header (issue mlflow/mlflow#22095).
+            # `Host: localhost:5001` from `kubectl port-forward` only matches
+            # `localhost:*`, not bare `localhost`.
+            - "--allowed-hosts=mlflow:*,mlflow.pdm.svc.cluster.local:*,localhost:*,127.0.0.1:*"
+            - "--backend-store-uri=sqlite:////mlflow-data/mlflow.db"
+            - "--default-artifact-root=mlflow-artifacts:/"
+            - "--artifacts-destination=/mlflow-data/artifacts"
+            - "--serve-artifacts"
+          ports:
+            - containerPort: 5000
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: /mlflow-data
+          # MLflow itself exposes /health -- use it for both probes.
+          # Long startup tolerance: SQLite migrations + uvicorn boot.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            periodSeconds: 5
+            failureThreshold: 12   # allow up to ~60s for first start
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            periodSeconds: 10
+            timeoutSeconds: 3
+          # MLflow 3.x is hungrier than 2.x -- uvicorn + FastAPI + periodic
+          # schedulers (online_scoring, trace_archival) + SQLAlchemy ORM all
+          # sit resident. 1Gi triggered OOMKilled in practice.
+          resources:
+            requests: { cpu: "100m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "2Gi"   }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mlflow-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: pdm
+spec:
+  type: ClusterIP
+  selector:
+    app: mlflow
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000

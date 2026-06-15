@@ -1,0 +1,9 @@
+# A namespace is K8s's apartment door -- everything for this project lives
+# inside `pdm` so we can `kubectl delete namespace pdm` and have the whole
+# environment vanish without touching other workloads on the cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pdm
+  labels:
+    app.kubernetes.io/part-of: predictive-maintenance

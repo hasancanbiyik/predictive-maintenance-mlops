@@ -1,0 +1,80 @@
+# FastAPI predictor: 2 replicas to demonstrate horizontal scaling for free.
+# Liveness on /health (always 200 while the process is up).
+# Readiness on /ready (503 until the model is loaded) -- this is what makes
+# rolling updates safe: traffic only flows to a pod once it can predict.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdm-api
+  namespace: pdm
+  labels:
+    app: pdm-api
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # never less than `replicas - 0 = 2` pods serving
+  selector:
+    matchLabels:
+      app: pdm-api
+  template:
+    metadata:
+      labels:
+        app: pdm-api
+    spec:
+      containers:
+        - name: api
+          # The :0.4.0 tag is what `docker compose build` produced. We load it
+          # into the kind cluster with `kind load docker-image` -- there's no
+          # registry involved for local dev.
+          image: predictive-maintenance-api:0.5.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: pdm-api-config
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+            failureThreshold: 18   # allow ~90s for first model pull from MLflow
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 15
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "1Gi"  }
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pdm-api
+  namespace: pdm
+spec:
+  # ClusterIP keeps it cluster-internal; we'll reach it via `kubectl port-forward`
+  # for local testing. In Phase 5b/9 we'd switch to LoadBalancer + Ingress.
+  type: ClusterIP
+  selector:
+    app: pdm-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

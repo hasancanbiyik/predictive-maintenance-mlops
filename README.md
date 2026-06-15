@@ -12,8 +12,8 @@ The model is a placeholder — the **production loop** (train → serve → cont
 | 1 | Data + baseline model (XGBoost F1 = 0.768 on test) | Done |
 | 2 | MLflow experiment tracking + registry | Done |
 | 3 | FastAPI serving (`/health`, `/predict`) | Done |
-| 4 | Docker + docker-compose (API + MLflow over HTTP) | In progress |
-| 5 | Kubernetes deploy (kind/minikube → AWS EKS) | Pending |
+| 4 | Docker + docker-compose (API + MLflow over HTTP) | Done |
+| 5 | Kubernetes deploy on kind (manifests in `k8s/`) | In progress |
 | 6 | CI/CD via GitHub Actions | Pending |
 | 7 | Prometheus + Grafana + Evidently drift reports | Pending |
 | 8 | Drift-triggered / scheduled auto-retraining (+ **DVC** for dataset versioning here) | Pending |
@@ -178,6 +178,57 @@ Wipe it (volumes too):
 
 ```bash
 docker compose down -v
+```
+
+## Kubernetes (Phase 5)
+
+Manifests live in `k8s/`: namespace, ConfigMap, MLflow (PVC + Deployment +
+Service), API (Deployment + Service). All inside a `pdm` namespace so the
+whole environment can be wiped with one command.
+
+```bash
+# 1. Create a local kind cluster
+kind create cluster --name pdm
+
+# 2. Build the API image (if compose hasn't already) and load it into kind.
+#    Without this, kind can't find the local image.
+docker compose build api
+kind load docker-image predictive-maintenance-api:0.4.0 --name pdm
+
+# 3. Apply the manifests
+kubectl apply -f k8s/
+
+# 4. Watch pods come up (MLflow first, then API)
+kubectl get pods -n pdm -w
+# Wait until both pods are Running and READY 1/1 (mlflow) or 2/2 (api).
+# The API will be Running but NOT READY until a model is registered --
+# that's the readiness probe doing its job.
+
+# 5. Port-forward MLflow so you can train against it from your laptop
+kubectl port-forward -n pdm svc/mlflow 5001:5000 &
+
+# 6. Train. The model gets registered into the in-cluster MLflow.
+MLFLOW_TRACKING_URI=http://localhost:5001 \
+  python -m src.training.train_baseline
+
+# 7. The API pods will pick up the new @staging alias on their next /ready
+#    poll (within ~10s) and become Ready. You can verify:
+kubectl get pods -n pdm
+
+# 8. Port-forward the API and hit it
+kubectl port-forward -n pdm svc/pdm-api 8000:8000 &
+curl -s http://127.0.0.1:8000/health | python -m json.tool
+curl -s -X POST http://127.0.0.1:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"H","air_temp_k":302.5,"process_temp_k":313.0,"rot_speed_rpm":1300,"torque_nm":75.0,"tool_wear_min":220}' \
+  | python -m json.tool
+```
+
+Tear down:
+
+```bash
+kubectl delete namespace pdm        # wipe just the app
+kind delete cluster --name pdm      # wipe the whole cluster
 ```
 
 ## Conventions

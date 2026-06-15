@@ -1,0 +1,14 @@
+# Env-var config the API container picks up at startup. Keeping these in a
+# ConfigMap (rather than baked into the Deployment) means we can change the
+# alias from `staging` to `production` later with `kubectl edit configmap`
+# and rollout-restart the API -- no image rebuild.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pdm-api-config
+  namespace: pdm
+data:
+  MLFLOW_TRACKING_URI: "http://mlflow:5000"
+  MODEL_NAME: "predictive_maintenance"
+  MODEL_ALIAS: "staging"
+  DECISION_THRESHOLD: "0.5"

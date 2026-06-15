@@ -23,8 +23,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import mlflow
@@ -75,29 +75,61 @@ def _load_classifier(uri: str) -> Any:
         return mlflow.xgboost.load_model(uri)
 
 
-@lru_cache(maxsize=1)
+# Cache only SUCCESSFUL bundle loads. lru_cache would cache None too, so a
+# pod that boots before MLflow has a model would never recover until restart.
+# A simple module-level dict + lock gives us "cache the win, retry the miss".
+_bundle_cache: dict[str, ModelBundle] = {}
+_bundle_lock = threading.Lock()
+
+
 def get_model_bundle() -> ModelBundle | None:
-    """Resolve `@alias` -> version, load the model, cache the bundle.
+    """Resolve `@alias` -> version, load the model, cache only on success.
 
     Returns None (instead of raising) when the registry has no match. This
     makes the function safe to use as a FastAPI dependency in both endpoints:
-    /predict treats None as a 503; /health treats None as 'degraded' (still
-    200 OK, because the *service* is alive even if the *model* isn't).
+    /predict treats None as 503; /health treats None as 'degraded' (still
+    200 OK -- the service is alive even if the model isn't).
+
+    Caching only successes means the API auto-recovers when a model gets
+    registered later. The trade-off: every request before first success
+    triggers a registry lookup. That's fine -- /ready hits this once per
+    10s probe, not per /predict call.
     """
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    client = MlflowClient()
-    try:
-        mv = client.get_model_version_by_alias(REGISTERED_MODEL_NAME, MODEL_ALIAS)
-    except MlflowException as e:
-        logger.warning("Model alias %s@%s not found: %s", REGISTERED_MODEL_NAME, MODEL_ALIAS, e)
-        return None
-    uri = f"models:/{REGISTERED_MODEL_NAME}@{MODEL_ALIAS}"
-    try:
-        model = _load_classifier(uri)
-    except Exception as e:
-        logger.error("Failed to load model %s: %s", uri, e)
-        return None
-    return ModelBundle(model=model, name=REGISTERED_MODEL_NAME, version=mv.version, alias=MODEL_ALIAS)
+    cached = _bundle_cache.get("bundle")
+    if cached is not None:
+        return cached
+
+    with _bundle_lock:
+        # Re-check after acquiring the lock (double-checked locking pattern).
+        cached = _bundle_cache.get("bundle")
+        if cached is not None:
+            return cached
+
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        client = MlflowClient()
+        try:
+            mv = client.get_model_version_by_alias(REGISTERED_MODEL_NAME, MODEL_ALIAS)
+        except MlflowException as e:
+            logger.warning(
+                "Model alias %s@%s not found: %s", REGISTERED_MODEL_NAME, MODEL_ALIAS, e
+            )
+            return None
+
+        uri = f"models:/{REGISTERED_MODEL_NAME}@{MODEL_ALIAS}"
+        try:
+            model = _load_classifier(uri)
+        except Exception as e:
+            logger.error("Failed to load model %s: %s", uri, e)
+            return None
+
+        bundle = ModelBundle(model=model, name=REGISTERED_MODEL_NAME, version=mv.version, alias=MODEL_ALIAS)
+        _bundle_cache["bundle"] = bundle
+        return bundle
+
+
+def _clear_model_cache() -> None:
+    """Test helper -- forces the next call to re-resolve the registry."""
+    _bundle_cache.clear()
 
 
 # --- App ----------------------------------------------------------------
@@ -126,14 +158,33 @@ def _to_feature_frame(req: PredictRequest) -> pd.DataFrame:
 
 @app.get("/health", response_model=HealthResponse)
 def health(bundle: ModelBundle | None = Depends(get_model_bundle)) -> HealthResponse:
-    """Liveness probe. Reports model identity if loaded, 'degraded' if not.
-
-    Always returns 200 -- the service is alive. The body tells you whether
-    the *model* is loaded. Kubernetes liveness probes care about the service;
-    readiness probes can be wired to this body in Phase 5.
+    """Liveness probe. Always 200. The service is alive whether or not the
+    model is loaded. K8s livenessProbe uses this -- restarting a pod when
+    only the model failed to load won't fix anything and just causes flapping.
     """
     if bundle is None:
         return HealthResponse(status="degraded")
+    return HealthResponse(
+        status="ok",
+        model_name=bundle.name,
+        model_version=str(bundle.version),
+        model_alias=bundle.alias,
+    )
+
+
+@app.get("/ready", response_model=HealthResponse)
+def ready(bundle: ModelBundle | None = Depends(get_model_bundle)) -> HealthResponse:
+    """Readiness probe. Returns 503 when the model isn't loaded.
+
+    K8s readinessProbe uses this -- a pod is excluded from the Service's load-
+    balancer rotation until /ready returns 200. This is what makes rolling
+    updates safe: new pods don't get traffic until they can actually predict.
+    """
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model not loaded",
+        )
     return HealthResponse(
         status="ok",
         model_name=bundle.name,

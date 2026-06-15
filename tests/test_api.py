@@ -35,7 +35,7 @@ def client():
     yield TestClient(app)
     app.dependency_overrides.clear()
     # Bust the lru_cache between tests in case anything triggered it.
-    app_module.get_model_bundle.cache_clear()
+    app_module._clear_model_cache()
 
 
 VALID_PAYLOAD = {
@@ -108,4 +108,26 @@ def test_health_reports_degraded_when_no_model():
         assert r2.status_code == 503
     finally:
         app.dependency_overrides.clear()
-        app_module.get_model_bundle.cache_clear()
+        app_module._clear_model_cache()
+
+
+def test_ready_returns_200_when_model_loaded(client):
+    """/ready is the K8s readiness probe -- 200 means 'send me traffic'."""
+    r = client.get("/ready")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+def test_ready_returns_503_when_no_model():
+    """/ready returns 503 when the model isn't loaded so K8s pulls the pod
+    out of the Service's rotation. /health stays 200 so K8s doesn't restart."""
+    app.dependency_overrides[get_model_bundle] = lambda: None
+    try:
+        c = TestClient(app)
+        r_ready = c.get("/ready")
+        r_health = c.get("/health")
+        assert r_ready.status_code == 503
+        assert r_health.status_code == 200  # liveness still alive
+    finally:
+        app.dependency_overrides.clear()
+        app_module._clear_model_cache()
